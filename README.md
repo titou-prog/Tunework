@@ -9,6 +9,9 @@ Mini-jeux pour apprendre à **chanter juste** : c'est la justesse de la voix (mi
 - **La Plongée de Kai** : le dauphin nage entre les rochers ; tiens la bonne note pour rester dans le passage.
 - **Le Sceau de Kitsune** : écoute la note de l'esprit farceur, puis tiens-la juste pour le sceller.
 - **L'Écho des Étoiles** : écoute une courte mélodie, puis rechante-la note après note.
+- **Les Lanternes du Festival** : chante la note d'une lanterne pour l'allumer avant qu'elle s'envole.
+- **L'Ascension d'Usagi** : chante la gamme marche après marche jusqu'à la lune, puis redescends.
+- **Le Dragon et la Perle** : fais glisser ta voix (sirène) pour suivre le ruban doré et gober les perles.
 - **Le Dojo de la Voix** : entraînement libre, voix affichée en direct.
 
 ## Réglages

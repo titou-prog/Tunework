@@ -194,9 +194,10 @@ const FONT = '"M PLUS Rounded 1c", system-ui, sans-serif';
    RÉGLAGES
    ========================================================= */
 const LS_KEY = 'tunework_settings_v1', BEST_KEY = 'tunework_best_v1';
-const DEF = { low: 60, high: 72, difficulty: 'moyen', octaveFree: true, guide: true, notation: 'fr', sens: 2, volume: 0.9 };
+const DEF = { low: 60, high: 72, difficulty: 'moyen', octaveFree: true, guide: true, notation: 'fr', sens: 2, volume: 0.9, v: 2 };
 let S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem(LS_KEY) || '{}')); } catch (e) {}
+if (!S.v || S.v < 2) { S.sens = 2; S.v = 2; } // nouveaux seuils de micro (beaucoup plus sensibles)
 function saveSettings() { try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {} updateSummary(); }
 
 const DIFF = {
@@ -205,7 +206,7 @@ const DIFF = {
   difficile: { label: 'Difficile', tol: 22, speed: 1.2, step: 4, hold: 1.8, time: 9,  scale: [0, 2, 4, 5, 7, 9, 11], echo: [3, 4, 4, 5, 5, 6], hideNames: true }
 };
 const D = () => DIFF[S.difficulty] || DIFF.moyen;
-const RMS_TH = { 1: 0.02, 2: 0.008, 3: 0.003 };
+const RMS_TH = { 1: 0.006, 2: 0.0018, 3: 0.0007 };
 
 const NF = ['Do', 'Do♯', 'Ré', 'Ré♯', 'Mi', 'Fa', 'Fa♯', 'Sol', 'Sol♯', 'La', 'La♯', 'Si'];
 const NE = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
@@ -672,20 +673,22 @@ const BirdGame = {
   id: 'bird', title: "L'Envol de Sora", replayable: true,
   init() {
     const d = D();
-    this.notes = melody(14, d.step); this.rings = []; this.idx = 0; this.timer = 0.4;
-    this.interval = 2.8 / d.speed; this.resize();
+    this.notes = melody(12, d.step); this.rings = []; this.idx = 0; this.timer = 0.4;
+    this.interval = 3.4 / d.speed; this.resize();
     this.y = H * 0.5; this.vy = 0; this.score = 0; this.combo = 0; this.maxCombo = 0; this.hits = 0; this.perfect = 0; this.done = 0;
     this.lastSing = -9; this.time = 0; this.trail = []; this.cents = [];
     this.clouds = makeClouds(7, W, H, 0.1, 0.6); this.petals = makePetals(24, W, H);
   },
-  resize() { this.speed = W * 0.2 * D().speed; this.bs = Math.max(18, Math.min(W, H) * 0.045); },
+  resize() { this.speed = W * 0.17 * D().speed; this.bs = Math.max(18, Math.min(W, H) * 0.045); },
+  tolG() { return D().tol * 1.6; },           // marge plus large que la tolérance de base
+  ringRy() { return tolPx() * 1.6 + this.bs * 0.75; },
   get bx() { return W * 0.25; },
   target() { return this.rings.find(r => !r.passed); },
   replay() { const tg = this.target(); if (tg) Pitch.playTone(tg.m, 0.7); },
   update(dt) {
     const d = D(); this.time += dt; this.timer -= dt;
     if (this.timer <= 0 && this.idx < this.notes.length) {
-      const m = this.notes[this.idx++]; this.rings.push({ x: W + 60, m, passed: false, res: null, fx: 0 });
+      const m = this.notes[this.idx++]; this.rings.push({ x: W + 60, m, passed: false, res: null, fx: 0, best: null });
       if (this.idx === 1 && S.guide) Pitch.playTone(m, 0.8);
       this.timer = this.interval;
     }
@@ -693,29 +696,34 @@ const BirdGame = {
     const tg = this.target(), ref = tg ? tg.m : (S.low + S.high) / 2;
     const sung = fold(Pitch.midi, ref), py = this.y;
     if (Pitch.gated) { /* on garde la position pendant la note guide */ }
-    else if (sung != null) { this.y = lerp(this.y, clamp(yFor(sung), H * 0.12, H * 0.94), Math.min(1, dt * 12)); this.lastSing = this.time; }
-    else if (this.time - this.lastSing > 0.4) this.y = Math.min(H * 0.92, this.y + H * 0.07 * dt);
+    else if (sung != null) { this.y = lerp(this.y, clamp(yFor(sung), H * 0.12, H * 0.94), Math.min(1, dt * 14)); this.lastSing = this.time; }
+    else if (this.time - this.lastSing > 0.8) this.y = Math.min(H * 0.92, this.y + H * 0.05 * dt);
     this.vy = (this.y - py) / Math.max(dt, 0.001);
     for (const p of this.trail) p.x -= this.speed * dt;
     if (this.time - this.lastSing < 0.2) this.trail.push({ x: this.bx - this.bs, y: this.y, h: (this.time * 200) % 360 });
     while (this.trail.length > 28) this.trail.shift();
+    const win = this.bs * 1.4;  // fenêtre de passage : on garde le meilleur moment pendant la traversée
     for (const r of this.rings) {
-      if (r.passed || r.x > this.bx) continue;
-      r.passed = true; this.done++;
-      const c = (mFor(this.y) - r.m) * 100;
+      if (r.passed) continue;
       const singing = this.time - this.lastSing < 0.5 || Pitch.gated;
-      const rt = singing ? rating(c, d.tol) : null;
+      if (Math.abs(r.x - this.bx) <= win && singing) {
+        const c = (mFor(this.y) - r.m) * 100;
+        if (r.best == null || Math.abs(c) < Math.abs(r.best)) r.best = c;
+      }
+      if (r.x >= this.bx - win) continue;
+      r.passed = true; this.done++;
+      const rt = r.best != null ? rating(r.best, this.tolG()) : null;
       if (rt) {
         r.res = 'hit'; this.hits++; if (rt.pts === 100) this.perfect++; this.combo++; this.maxCombo = Math.max(this.maxCombo, this.combo);
-        this.score += Math.round(rt.pts * (1 + Math.min(this.combo, 10) * 0.1)); this.cents.push(Math.abs(c));
+        this.score += Math.round(rt.pts * (1 + Math.min(this.combo, 10) * 0.1)); this.cents.push(Math.abs(r.best));
         FX.burst(r.x, yFor(r.m), rt.col, 24); FX.text(this.bx + 60, this.y - 60, rt.txt, rt.col, 46); Pitch.sfx('ok');
       } else {
         r.res = 'miss'; this.combo = 0; FX.shake = 0.25; Pitch.sfx('ko');
         FX.text(this.bx + 60, this.y - 60, 'RATÉ…', '#fca5a5', 40);
-        FX.text(this.bx + 60, this.y - 18, !singing ? 'Chante !' : (c > 0 ? 'Trop aigu ▼' : 'Trop grave ▲'), '#fff', 24, 1.3);
+        FX.text(this.bx + 60, this.y - 18, r.best == null ? 'Chante !' : (r.best > 0 ? 'Trop aigu ▼' : 'Trop grave ▲'), '#fff', 24, 1.3);
       }
       const nx = this.target();
-      if (nx && S.guide) Pitch.playTone(nx.m, 0.7, 0.3);
+      if (nx && S.guide) Pitch.playTone(nx.m, 0.6, 0.15);
     }
     this.rings = this.rings.filter(r => r.x > -100);
     hud({ score: this.score, combo: this.combo, prog: this.done / this.notes.length });
@@ -725,16 +733,16 @@ const BirdGame = {
     }
   },
   drawRing(c, r, half) {
-    const y = yFor(r.m), ry = tolPx() + this.bs * 0.6, rx = ry * 0.32;
+    const y = yFor(r.m), ry = this.ringRy(), rx = ry * 0.32;
     let col = '#fbbf24', sc = 1, a = 1;
     if (r.res === 'hit') { col = '#4ade80'; sc = 1 + r.fx * 0.8; a = Math.max(0, 1 - r.fx * 1.4); }
     if (r.res === 'miss') { col = '#94a3b8'; a = 0.6; }
     c.save(); c.globalAlpha = a; c.translate(r.x, y); c.scale(sc, sc);
     const a0 = half === 'back' ? Math.PI / 2 : -Math.PI / 2, a1 = half === 'back' ? Math.PI * 1.5 : Math.PI / 2;
-    if (half === 'back') { c.fillStyle = 'rgba(255,255,255,.12)'; ell(c, 0, 0, rx, ry); c.fill(); }
+    if (half === 'back') { c.fillStyle = 'rgba(255,255,255,.14)'; ell(c, 0, 0, rx, ry); c.fill(); }
     c.lineCap = 'round';
-    c.beginPath(); c.ellipse(0, 0, rx, ry, 0, a0, a1); c.lineWidth = 13; c.strokeStyle = INK; c.stroke();
-    c.beginPath(); c.ellipse(0, 0, rx, ry, 0, a0, a1); c.lineWidth = 7; c.strokeStyle = col; c.stroke();
+    c.beginPath(); c.ellipse(0, 0, rx, ry, 0, a0, a1); c.lineWidth = 14; c.strokeStyle = INK; c.stroke();
+    c.beginPath(); c.ellipse(0, 0, rx, ry, 0, a0, a1); c.lineWidth = 8; c.strokeStyle = col; c.stroke();
     c.beginPath(); c.ellipse(-2, -2, rx, ry, 0, a0, a1); c.lineWidth = 2; c.strokeStyle = 'rgba(255,255,255,.7)'; c.stroke();
     c.restore();
     if (half === 'front' && !r.passed) badge(c, r.x, y - ry - 22, nn(r.m), r === this.target() ? '#fde047' : '#fff', INK, 16);
@@ -767,7 +775,7 @@ const DolphinGame = {
   id: 'dolphin', title: 'La Plongée de Kai', hearts: true, replayable: true,
   init() {
     const d = D();
-    this.notes = melody(9, Math.max(1, d.step - 1)); this.resize();
+    this.notes = melody(8, Math.max(1, d.step - 1)); this.resize();
     this.cam = 0; this.y = yFor(this.notes[0]); this.vy = 0; this.heartsLeft = 5; this.inv = 0;
     this.score = 0; this.time = 0; this.lastSing = -9; this.inTune = 0; this.total = 0; this.streak = 0; this.toneIdx = -1;
     this.seg = this.notes.map(() => ({ in: 0, tot: 0 }));
@@ -775,60 +783,66 @@ const DolphinGame = {
     this.fish = Array.from({ length: 8 }, () => ({ x: rand(0, W), y: rand(H * 0.2, H * 0.8), v: rand(15, 40), s: rand(5, 10) }));
     this.over = false;
   },
-  resize() { const d = D(); this.speed = W * 0.2 * d.speed; this.segLen = this.speed * 2.7; this.lead = W * 0.95; this.dx = W * 0.28; this.ds = Math.max(20, Math.min(W, H) * 0.05); },
+  /* Notes plus courtes (≈1,8 s) et passage bien plus large qu'avant */
+  resize() { const d = D(); this.speed = W * 0.18 * d.speed; this.segLen = this.speed * 1.8; this.lead = W * 0.95; this.dx = W * 0.28; this.ds = Math.max(20, Math.min(W, H) * 0.05); },
+  tolG() { return D().tol * 1.6; },
   noise(wx) { return Math.sin(wx * 0.021) * 0.5 + Math.sin(wx * 0.057 + 1) * 0.3 + Math.sin(wx * 0.13 + 2) * 0.2; },
   center(wx) {
     const n = this.notes.length, L = this.segLen, rel = wx - this.lead;
     if (rel < 0) return this.notes[0];
     const i = Math.floor(rel / L); if (i >= n) return this.notes[n - 1];
-    const local = rel - i * L, ramp = L * 0.22;
+    const local = rel - i * L, ramp = L * 0.3;
     return (i > 0 && local < ramp) ? lerp(this.notes[i - 1], this.notes[i], smooth(local / ramp)) : this.notes[i];
   },
   gap(wx) {
-    const base = tolPx() + this.ds * 0.95, rel = wx - this.lead, end = this.notes.length * this.segLen; let open = 0;
-    if (rel < 0) open = clamp(-rel / (this.segLen * 0.5), 0, 1); else if (rel > end) open = clamp((rel - end) / (this.segLen * 0.5), 0, 1);
-    return base + smooth(open) * H * 0.6;
+    const L = this.segLen, base = pxSemi() * this.tolG() / 100 * 1.4 + this.ds * 1.5, rel = wx - this.lead, end = this.notes.length * L;
+    let open = 0;
+    if (rel < 0) open = clamp(-rel / (L * 0.6), 0, 1); else if (rel > end) open = clamp((rel - end) / (L * 0.6), 0, 1);
+    /* « poche de respiration » : le passage s'élargit à chaque changement de note */
+    let pocket = 0;
+    if (rel >= 0 && rel <= end) { const local = rel - Math.floor(rel / L) * L, dist = Math.min(local, L - local); pocket = pxSemi() * 0.9 * (1 - smooth(clamp(dist / (L * 0.28), 0, 1))); }
+    return base + pocket + smooth(open) * H * 0.6;
   },
   segIndex(wx) { const rel = wx - this.lead; return rel < 0 ? -1 : Math.floor(rel / this.segLen); },
-  replay() { const i = clamp(this.segIndex(this.cam + this.dx), 0, this.notes.length - 1); Pitch.playTone(this.notes[i], 0.8); },
+  replay() { const i = clamp(this.segIndex(this.cam + this.dx), 0, this.notes.length - 1); Pitch.playTone(this.notes[i], 0.7); },
   update(dt) {
     const d = D(); this.time += dt; this.cam += this.speed * dt; this.inv = Math.max(0, this.inv - dt);
     const wx = this.cam + this.dx, n = this.notes.length;
     for (let j = this.toneIdx + 1; j < n; j++) {
       const sx = this.lead + j * this.segLen - this.cam;
-      if (sx <= W) { this.toneIdx = j; if (S.guide && (j === 0 || this.notes[j] !== this.notes[j - 1])) Pitch.playTone(this.notes[j], 0.8); }
+      if (sx <= W * 0.85) { this.toneIdx = j; if (S.guide && (j === 0 || this.notes[j] !== this.notes[j - 1])) Pitch.playTone(this.notes[j], 0.55); }
       else break;
     }
     const tgt = this.center(wx), sung = fold(Pitch.midi, tgt), py = this.y;
     if (Pitch.gated) {}
-    else if (sung != null) { this.y = lerp(this.y, clamp(yFor(sung), H * 0.06, H * 0.95), Math.min(1, dt * 11)); this.lastSing = this.time; }
-    else if (this.time - this.lastSing > 0.5) this.y = Math.min(H * 0.94, this.y + H * 0.06 * dt);
+    else if (sung != null) { this.y = lerp(this.y, clamp(yFor(sung), H * 0.06, H * 0.95), Math.min(1, dt * 12)); this.lastSing = this.time; }
+    else if (this.time - this.lastSing > 1.0) this.y = Math.min(H * 0.94, this.y + H * 0.04 * dt);
     this.vy = (this.y - py) / Math.max(dt, 0.001);
     const si = this.segIndex(wx);
     if (si >= 0 && si < n) {
-      const c = (mFor(this.y) - tgt) * 100, singing = this.time - this.lastSing < 0.4 || Pitch.gated;
+      const c = (mFor(this.y) - tgt) * 100, singing = this.time - this.lastSing < 0.6 || Pitch.gated;
       this.total += dt; this.seg[si].tot += dt;
-      if (singing && Math.abs(c) <= d.tol) {
+      if (singing && Math.abs(c) <= this.tolG()) {
         this.inTune += dt; this.seg[si].in += dt; this.streak += dt;
-        this.score += Math.round(dt * 80 * (1.5 - Math.abs(c) / d.tol * 0.5) * 10) / 10;
+        this.score += Math.round(dt * 80 * (1.5 - Math.abs(c) / this.tolG() * 0.5) * 10) / 10;
         if (this.streak >= 1.5) { this.streak = 0; FX.text(this.dx + 50, this.y - 50, 'SUGOI !', '#fde047', 34, 0.9); FX.burst(this.dx, this.y, '#a5f3fc', 10, 150); }
       } else this.streak = 0;
       const dy = Math.abs(this.y - yFor(tgt));
-      if (dy > this.gap(wx) - this.ds * 0.5 && this.inv <= 0) {
-        this.heartsLeft--; this.inv = 1.6; FX.shake = 0.4; FX.doFlash('248,113,113', 0.55); Pitch.sfx('ko');
+      if (dy > this.gap(wx) - this.ds * 0.35 && this.inv <= 0) {
+        this.heartsLeft--; this.inv = 1.8; FX.shake = 0.4; FX.doFlash('248,113,113', 0.5); Pitch.sfx('ko');
         FX.text(this.dx + 50, this.y - 50, 'AÏE !', '#fca5a5', 44); FX.burst(this.dx, this.y, '#fff', 14, 180, 'bubble');
         FX.text(this.dx + 50, this.y - 8, mFor(this.y) > tgt ? 'Trop aigu ▼' : 'Trop grave ▲', '#fff', 24, 1.2);
+        this.y = lerp(this.y, yFor(tgt), 0.5); // Kai est repoussé vers le passage
         if (this.heartsLeft <= 0) { this.over = true; this.end(); return; }
       }
     }
     for (const b of this.bubbles) { b.y -= b.v * dt; b.x += Math.sin(this.time * 2 + b.r) * 10 * dt; if (b.y < H * 0.08) { b.y = H + 10; b.x = rand(0, W); } }
     for (const f of this.fish) { f.x -= f.v * dt; if (f.x < -30) { f.x = W + 30; f.y = rand(H * 0.2, H * 0.8); } }
-    const prog = clamp((wx - this.lead) / (n * this.segLen), 0, 1);
-    hud({ score: Math.floor(this.score), hearts: this.heartsLeft, prog });
-    if (wx - this.lead > n * this.segLen + this.segLen * 0.3) this.end();
+    hud({ score: Math.floor(this.score), hearts: this.heartsLeft, prog: clamp((wx - this.lead) / (n * this.segLen), 0, 1) });
+    if (wx - this.lead > n * this.segLen + this.segLen * 0.4) this.end();
   },
   end() {
-    const ok = this.seg.filter(s => s.tot > 0 && s.in / s.tot >= 0.6).length, acc = this.total ? this.inTune / this.total : 0;
+    const ok = this.seg.filter(s => s.tot > 0 && s.in / s.tot >= 0.5).length, acc = this.total ? this.inTune / this.total : 0;
     Engine.finish({ score: Math.floor(this.score), acc: this.over ? acc * 0.7 : acc, title: this.over ? 'KAI EST FATIGUÉ…' : null, lines: [['Passages réussis', `${ok} / ${this.notes.length}`], ['Temps juste', `${Math.round(acc * 100)} %`], ['Cœurs restants', `${Math.max(0, this.heartsLeft)} / 5`]] });
   },
   drawRocks(c, t) {
@@ -909,7 +923,7 @@ const KitsuneGame = {
       const sung = fold(Pitch.midi, this.tgt); this.sung = sung;
       if (sung != null && !Pitch.gated) {
         const c = (sung - this.tgt) * 100;
-        if (Math.abs(c) <= d.tol) { this.charge += dt / d.hold; this.acc.push(Math.abs(c)); if (Math.random() < 0.3) FX.burst(W * 0.25 + rand(-40, 40), H * 0.62, '#7dd3fc', 1, 120); }
+        if (Math.abs(c) <= d.tol * 1.25) { this.charge += dt / d.hold; this.acc.push(Math.abs(c)); if (Math.random() < 0.3) FX.burst(W * 0.25 + rand(-40, 40), H * 0.62, '#7dd3fc', 1, 120); }
         else this.charge -= dt * 0.3;
       } else this.charge -= dt * 0.18;
       this.charge = clamp(this.charge, 0, 1);
@@ -991,7 +1005,7 @@ const KitsuneGame = {
     }
     if (this.state === 'listen') speech(c, kx + ks * 0.7, ky - ks * 1.3, '🔊 Écoute bien…', 18);
     if (this.state === 'sing' && this.st < 1.2) mangaText(c, 'CHANTE !', W * 0.5, H * 0.5, Math.min(W, H) * 0.1, '#fde047', this.st, 1.2);
-    if (this.state === 'sing') drawMeter(c, W - 92, H * 0.24, 62, H * 0.5, this.tgt, this.sung, d.tol);
+    if (this.state === 'sing') drawMeter(c, W - 92, H * 0.24, 62, H * 0.5, this.tgt, this.sung, d.tol * 1.25);
     for (let i = 0; i < this.notes.length; i++) {
       const x = W / 2 + (i - (this.notes.length - 1) / 2) * 30, y = H * 0.93, r = this.results[i];
       c.fillStyle = r === 'ok' ? '#fde047' : r === 'ko' ? '#475569' : i === this.i ? '#f9a8d4' : 'rgba(255,255,255,.35)';
@@ -1030,7 +1044,7 @@ const EchoGame = {
       }
     } else if (this.state === 'sing') {
       const tgt = this.seq[this.k], sung = fold(Pitch.midi, tgt); this.sung = sung; this.noteT += dt;
-      if (sung != null && !Pitch.gated && Math.abs((sung - tgt) * 100) <= d.tol) this.hold += dt;
+      if (sung != null && !Pitch.gated && Math.abs((sung - tgt) * 100) <= d.tol * 1.25) this.hold += dt;
       else this.hold = Math.max(0, this.hold - dt * 0.5);
       const need = d.hold * 0.45;
       if (this.hold >= need) {
@@ -1162,7 +1176,318 @@ const DojoGame = {
   }
 };
 
-const GAMES = { bird: BirdGame, dolphin: DolphinGame, kitsune: KitsuneGame, echo: EchoGame, dojo: DojoGame };
+/* =========================================================
+   NOUVEAUX PERSONNAGES
+   ========================================================= */
+function drawBunny(c, x, y, s, t, squash = 0) {
+  c.save(); c.translate(x, y); c.scale(1 + squash * 0.15, 1 - squash * 0.15);
+  c.lineWidth = Math.max(2, s * 0.07); c.strokeStyle = INK; c.lineJoin = 'round';
+  const w1 = Math.sin(t * 3) * 0.08, w2 = Math.sin(t * 3 + 1) * 0.08;
+  [[-0.28, -0.25 + w1], [0.28, 0.25 + w2]].forEach(([ex, rot]) => {
+    c.save(); c.translate(ex * s, -s * 0.7); c.rotate(rot);
+    c.fillStyle = '#fff'; ell(c, 0, -s * 0.55, s * 0.2, s * 0.6); c.fill(); c.stroke();
+    c.fillStyle = '#fbcfe8'; ell(c, 0, -s * 0.52, s * 0.1, s * 0.45); c.fill(); c.restore();
+  });
+  c.fillStyle = '#fff'; ell(c, 0, s * 0.62, s * 0.55, s * 0.45); c.fill(); c.stroke();
+  ell(c, -s * 0.35, s * 1.0, s * 0.22, s * 0.12); c.fill(); c.stroke(); ell(c, s * 0.35, s * 1.0, s * 0.22, s * 0.12); c.fill(); c.stroke();
+  ell(c, 0, 0, s * 0.72, s * 0.62); c.fill(); c.stroke();
+  animeEye(c, -s * 0.27, -s * 0.02, s * 0.14, s * 0.2, '#ec4899'); animeEye(c, s * 0.27, -s * 0.02, s * 0.14, s * 0.2, '#ec4899');
+  blush(c, -s * 0.42, s * 0.2, s * 0.12); blush(c, s * 0.42, s * 0.2, s * 0.12);
+  c.fillStyle = '#f472b6'; ell(c, 0, s * 0.16, s * 0.06, s * 0.045); c.fill();
+  c.lineWidth = Math.max(1.5, s * 0.04); c.beginPath(); c.arc(-s * 0.06, s * 0.24, s * 0.06, 0.2, Math.PI - 0.2); c.arc(s * 0.06, s * 0.24, s * 0.06, 0.2, Math.PI - 0.2); c.stroke();
+  c.restore();
+}
+function drawNeko(c, x, y, s, t) {
+  c.save(); c.translate(x, y + Math.sin(t * 2) * s * 0.04);
+  c.lineWidth = Math.max(2, s * 0.07); c.strokeStyle = INK; c.lineJoin = 'round';
+  c.fillStyle = '#fff7ed'; ell(c, 0, s * 0.9, s * 0.55, s * 0.45); c.fill(); c.stroke();
+  c.save(); c.translate(s * 0.45, s * 1.0); c.rotate(-0.6 + Math.sin(t * 3) * 0.3); c.fillStyle = '#fb923c'; ell(c, s * 0.35, 0, s * 0.4, s * 0.1); c.fill(); c.stroke(); c.restore();
+  [-1, 1].forEach(k => { c.fillStyle = k < 0 ? '#fb923c' : '#fff7ed'; c.beginPath(); c.moveTo(k * s * 0.7, -s * 0.2); c.lineTo(k * s * 0.62, -s * 0.85); c.lineTo(k * s * 0.15, -s * 0.5); c.closePath(); c.fill(); c.stroke(); });
+  c.fillStyle = '#fff7ed'; ell(c, 0, 0, s * 0.8, s * 0.62); c.fill(); c.stroke();
+  c.save(); ell(c, 0, 0, s * 0.8, s * 0.62); c.clip(); c.fillStyle = '#fb923c'; ell(c, -s * 0.55, -s * 0.35, s * 0.4, s * 0.35); c.fill(); c.fillStyle = '#44403c'; ell(c, s * 0.6, -s * 0.4, s * 0.3, s * 0.25); c.fill(); c.restore();
+  ell(c, 0, 0, s * 0.8, s * 0.62); c.stroke();
+  animeEye(c, -s * 0.28, -s * 0.02, s * 0.14, s * 0.19, '#22c55e'); animeEye(c, s * 0.28, -s * 0.02, s * 0.14, s * 0.19, '#22c55e');
+  blush(c, -s * 0.45, s * 0.2, s * 0.11); blush(c, s * 0.45, s * 0.2, s * 0.11);
+  c.fillStyle = '#f472b6'; ell(c, 0, s * 0.14, s * 0.06, s * 0.04); c.fill();
+  c.lineWidth = Math.max(1.2, s * 0.03); c.beginPath(); c.arc(-s * 0.06, s * 0.2, s * 0.06, 0.2, Math.PI - 0.2); c.arc(s * 0.06, s * 0.2, s * 0.06, 0.2, Math.PI - 0.2);
+  [-1, 1].forEach(k => { c.moveTo(k * s * 0.35, s * 0.12); c.lineTo(k * s * 0.85, s * 0.05); c.moveTo(k * s * 0.35, s * 0.2); c.lineTo(k * s * 0.85, s * 0.25); }); c.stroke();
+  c.restore();
+}
+function paperLantern(c, x, y, s, on, t, label) {
+  const fl = 0.85 + 0.15 * Math.sin(t * 8 + x);
+  glow(c, x, y, s * (1.8 + on * 1.8), `rgba(251,191,36,${(0.12 + on * 0.55) * fl})`);
+  c.save(); c.lineWidth = 3; c.strokeStyle = INK; c.lineJoin = 'round';
+  c.beginPath(); c.moveTo(x, y - s * 1.05); c.lineTo(x, y - s * 1.5); c.stroke();
+  c.fillStyle = INK; rr(c, x - s * 0.45, y - s * 1.12, s * 0.9, s * 0.18, 4); c.fill(); rr(c, x - s * 0.45, y + s * 0.94, s * 0.9, s * 0.18, 4); c.fill();
+  const r1 = Math.round(lerp(120, 253, on)), g1 = Math.round(lerp(28, 186, on)), b1 = Math.round(lerp(60, 116, on));
+  const g = c.createRadialGradient(x, y, s * 0.1, x, y, s);
+  g.addColorStop(0, `rgb(${Math.min(255, r1 + 40)},${Math.min(255, g1 + 50)},${Math.min(255, b1 + 40)})`); g.addColorStop(1, `rgb(${r1},${g1},${b1})`);
+  c.fillStyle = g; ell(c, x, y, s * 0.82, s); c.fill(); c.stroke();
+  c.strokeStyle = 'rgba(29,26,58,.3)'; c.lineWidth = 1.5;
+  for (let i = -2; i <= 2; i++) { ell(c, x, y + i * s * 0.35, s * 0.82 * Math.sqrt(1 - (i * 0.35) ** 2), s * 0.08); c.stroke(); }
+  c.strokeStyle = INK; c.lineWidth = 3; c.beginPath(); c.moveTo(x, y + s * 1.12); c.lineTo(x, y + s * 1.45); c.stroke();
+  c.fillStyle = '#ef4444'; ell(c, x, y + s * 1.55, s * 0.1, s * 0.16); c.fill();
+  if (label) { c.font = `900 ${Math.round(s * 0.55)}px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.lineWidth = 4; c.strokeStyle = 'rgba(255,255,255,.85)'; c.strokeText(label, x, y + 2); c.fillStyle = INK; c.fillText(label, x, y + 2); }
+  c.restore();
+}
+function drawDragonHead(c, x, y, s, t, tilt = 0) {
+  c.save(); c.translate(x, y); c.rotate(tilt);
+  c.lineWidth = Math.max(2, s * 0.07); c.strokeStyle = INK; c.lineJoin = 'round';
+  c.fillStyle = '#ef4444';
+  for (let i = 0; i < 4; i++) { c.save(); c.rotate(Math.PI * 0.75 + i * 0.28 + Math.sin(t * 6 + i) * 0.06); c.beginPath(); c.moveTo(s * 0.4, -s * 0.15); c.lineTo(s * 1.15, 0); c.lineTo(s * 0.4, s * 0.15); c.closePath(); c.fill(); c.stroke(); c.restore(); }
+  c.fillStyle = '#fde047';
+  [-1, 1].forEach(k => { c.beginPath(); c.moveTo(-s * 0.15, k * -s * 0.45 - s * 0.05); c.quadraticCurveTo(-s * 0.55, -s * 1.0 * (k > 0 ? 1 : 0.85), -s * 0.75, -s * 1.05 * (k > 0 ? 1 : 0.8)); c.quadraticCurveTo(-s * 0.35, -s * 0.6, s * 0.1, -s * 0.4); c.closePath(); c.fill(); c.stroke(); });
+  c.fillStyle = '#34d399'; ell(c, 0, 0, s * 0.75, s * 0.6); c.fill(); c.stroke();
+  c.fillStyle = '#a7f3d0'; ell(c, s * 0.62, s * 0.12, s * 0.42, s * 0.3); c.fill(); c.stroke();
+  c.fillStyle = INK; ell(c, s * 0.9, s * 0.02, s * 0.04, s * 0.03); c.fill(); ell(c, s * 0.82, s * 0.0, s * 0.04, s * 0.03); c.fill();
+  c.lineWidth = Math.max(1.5, s * 0.04); c.beginPath(); c.arc(s * 0.65, s * 0.18, s * 0.15, 0.3, 1.8); c.stroke();
+  c.strokeStyle = '#1d1a3a'; c.lineWidth = Math.max(1.5, s * 0.035); c.beginPath();
+  c.moveTo(s * 0.85, s * 0.12); c.quadraticCurveTo(s * 1.3, s * 0.0 + Math.sin(t * 4) * s * 0.15, s * 1.55, s * 0.35 + Math.sin(t * 4 + 1) * s * 0.2);
+  c.moveTo(s * 0.8, s * 0.22); c.quadraticCurveTo(s * 1.1, s * 0.5 + Math.sin(t * 4 + 2) * s * 0.1, s * 1.35, s * 0.7 + Math.sin(t * 4 + 3) * s * 0.15); c.stroke();
+  animeEye(c, s * 0.15, -s * 0.12, s * 0.17, s * 0.24, '#f59e0b');
+  blush(c, s * 0.3, s * 0.2, s * 0.12);
+  c.restore();
+}
+
+/* =========================================================
+   JEU 5 : LES LANTERNES DU FESTIVAL (chanter la note d'une lanterne)
+   ========================================================= */
+const LanternGame = {
+  id: 'lantern', title: 'Les Lanternes du Festival',
+  init() {
+    this.dur = { facile: 75, moyen: 60, difficile: 50 }[S.difficulty] || 60;
+    this.time = 0; this.L = []; this.spawnT = 0.6; this.lit = 0; this.missed = 0; this.score = 0; this.combo = 0; this.maxCombo = 0;
+    this.stars = makeStars(80, W, H, 0.5); this.sung = null;
+  },
+  resize() { this.stars = makeStars(80, W, H, 0.5); },
+  spawn() {
+    const sc = scaleNotes(), used = this.L.filter(l => !l.done).map(l => l.m), opts = sc.filter(m => !used.includes(m));
+    if (!opts.length) return;
+    const m = opts[Math.floor(Math.random() * opts.length)], s = Math.max(28, Math.min(W, H) * 0.06);
+    let x, tries = 0;
+    do { x = rand(W * 0.14, W * 0.86); tries++; } while (tries < 25 && this.L.some(l => !l.done && Math.abs(l.x - x) < s * 3 && l.y > H * 0.45));
+    this.L.push({ m, x, y: H + s * 1.6, s, charge: 0, done: false, lit: false, sway: rand(0, TAU) });
+    if (S.guide) Pitch.playTone(m, 0.6);
+  },
+  tap(x, y) { for (const l of this.L) if (!l.done && Math.hypot(l.x - x, l.y - y) < l.s * 1.4) { Pitch.playTone(l.m, 0.8); return; } },
+  update(dt) {
+    const d = D(); this.time += dt; this.spawnT -= dt;
+    const active = this.L.filter(l => !l.done).length, maxA = S.difficulty === 'facile' ? 2 : 3;
+    if (this.spawnT <= 0 && this.time < this.dur - 4) { if (active < maxA) this.spawn(); this.spawnT = rand(2.2, 3.4) / d.speed; }
+    const rise = H / (12 / d.speed); this.sung = Pitch.midi;
+    for (const l of this.L) {
+      if (l.done) { l.y -= rise * dt * (l.lit ? 2.5 : 1.2); continue; }
+      l.y -= rise * dt;
+      const f = fold(Pitch.midi, l.m);
+      if (f != null && !Pitch.gated && Math.abs((f - l.m) * 100) <= d.tol * 1.5) l.charge += dt / 0.7;
+      else l.charge = Math.max(0, l.charge - dt * 0.4);
+      if (l.charge >= 1) {
+        l.done = true; l.lit = true; this.lit++; this.combo++; this.maxCombo = Math.max(this.maxCombo, this.combo);
+        const pts = Math.round((60 + clamp(l.y / H, 0, 1) * 60) * (1 + Math.min(this.combo, 8) * 0.1)); this.score += pts;
+        ['#fde047', '#f472b6', '#7dd3fc'].forEach((col, i) => FX.burst(l.x, l.y, col, 18, 260 + i * 60));
+        FX.text(l.x, l.y - l.s * 1.9, nn(l.m) + ' !', '#fde047', 34); Pitch.sfx('ok');
+      } else if (l.y < l.s * 1.2) { l.done = true; this.missed++; this.combo = 0; FX.text(l.x, H * 0.16, 'Envolée…', '#cbd5e1', 26); }
+    }
+    this.L = this.L.filter(l => l.y > -l.s * 4);
+    hud({ score: this.score, combo: this.combo, prog: clamp(this.time / this.dur, 0, 1) });
+    if (this.time >= this.dur) {
+      const tot = this.lit + this.missed;
+      Engine.finish({ score: this.score, acc: tot ? this.lit / tot : 0, lines: [['Lanternes allumées', `${this.lit} / ${tot}`], ['Meilleur combo', this.maxCombo]] });
+    }
+  },
+  draw(c) {
+    const t = Engine.t;
+    c.fillStyle = vgrad(c, H, [[0, '#0b1030'], [0.55, '#2a1650'], [1, '#7a2363']]); c.fillRect(0, 0, W, H);
+    drawStars(c, this.stars, t);
+    mountains(c, W, H, H * 0.78, H * 0.18, 40, 'rgba(30,16,60,.9)', 5);
+    c.strokeStyle = INK; c.lineWidth = 2; c.beginPath(); c.moveTo(0, H * 0.13); c.quadraticCurveTo(W / 2, H * 0.22, W, H * 0.13); c.stroke();
+    for (let i = 1; i < 12; i++) { const x = W * i / 12, y = H * 0.13 + Math.sin(Math.PI * i / 12) * H * 0.045; glow(c, x, y + 8, 18, 'rgba(251,146,60,.5)'); c.fillStyle = i % 2 ? '#f87171' : '#fbbf24'; ell(c, x, y + 8, 6, 8); c.fill(); }
+    c.fillStyle = '#1a0f2e'; c.fillRect(0, H * 0.84, W, H * 0.16);
+    for (let i = 0; i < 6; i++) {
+      const x = i * W / 5 - 30, w = W * 0.16, y = H * 0.74;
+      c.fillStyle = '#2b1640'; c.fillRect(x, y, w, H * 0.1);
+      c.fillStyle = i % 2 ? '#b91c1c' : '#1d4ed8'; c.beginPath(); c.moveTo(x - 10, y + 4); c.lineTo(x + w / 2, y - 24); c.lineTo(x + w + 10, y + 4); c.closePath(); c.fill(); c.lineWidth = 2; c.strokeStyle = INK; c.stroke();
+      glow(c, x + w / 2, y + H * 0.05, w * 0.5, 'rgba(251,191,36,.35)'); c.fillStyle = 'rgba(253,230,138,.85)'; c.fillRect(x + w * 0.2, y + H * 0.02, w * 0.6, H * 0.05);
+    }
+    for (const l of this.L) {
+      const sx = l.x + Math.sin(t * 1.3 + l.sway) * 8;
+      if (!l.done && l.charge > 0) { c.strokeStyle = '#4ade80'; c.lineWidth = 6; c.lineCap = 'round'; c.beginPath(); c.arc(sx, l.y, l.s * 1.35, -Math.PI / 2, -Math.PI / 2 + TAU * l.charge); c.stroke(); }
+      c.globalAlpha = l.done && !l.lit ? 0.5 : 1;
+      paperLantern(c, sx, l.y, l.s, l.lit ? 1 : l.charge * 0.8, t, (D().hideNames && !l.lit) ? '?' : nn(l.m));
+      c.globalAlpha = 1;
+    }
+    const ns = Math.max(30, Math.min(W, H) * 0.065);
+    drawNeko(c, W * 0.08 + ns * 0.3, H * 0.86, ns, t);
+    if (this.time < 6) { badge(c, W / 2, H * 0.3, 'Chante la note d’une lanterne pour l’allumer !', '#fff', INK, 17); badge(c, W / 2, H * 0.3 + 34, '👆 Touche une lanterne pour entendre sa note', '#fde047', INK, 14); }
+    const left = Math.max(0, Math.ceil(this.dur - this.time));
+    badge(c, W / 2, H * 0.92, Pitch.gated ? '🔊 Écoute…' : `⏱ ${left} s   ♪ ${this.sung != null ? nn(this.sung) : '…'}`, '#fff', INK, 16);
+  }
+};
+
+/* =========================================================
+   JEU 6 : L'ASCENSION D'USAGI (gamme montante puis descendante)
+   ========================================================= */
+const StairsGame = {
+  id: 'stairs', title: "L'Ascension d'Usagi", replayable: true,
+  init() {
+    const pcs = [0, 2, 4, 5, 7, 9, 11], len = S.difficulty === 'facile' ? 5 : 8, all = [];
+    for (let m = S.low - 12; m <= S.high + 12; m++) if (pcs.includes(((m % 12) + 12) % 12)) all.push(m);
+    let best = -1, bestScore = 1e9;
+    for (let i = 0; i + len - 1 < all.length; i++) {
+      if (((all[i] % 12) + 12) % 12 !== 0) continue; // on part toujours d'un Do
+      const lo = all[i], hi = all[i + len - 1];
+      const out = Math.max(0, S.low - lo) + Math.max(0, hi - S.high);
+      if (out < bestScore) { bestScore = out; best = i; }
+    }
+    if (best < 0) best = 0;
+    this.up = all.slice(best, best + len);
+    this.path = this.up.concat(this.up.slice(0, -1).reverse());
+    this.k = -1; this.hold = 0; this.noteT = 0; this.helped = new Set(); this.helpT = 0;
+    this.hop = null; this.score = 0; this.time = 0; this.finished = false; this.sung = null;
+    this.stars = makeStars(70, W, H, 0.6); this.clouds = makeClouds(5, W, H, 0.1, 0.5);
+    this.toneAtStart = true;
+  },
+  resize() { this.stars = makeStars(70, W, H, 0.6); },
+  ys(m) { const lo = this.up[0] - 1, hi = this.up[this.up.length - 1] + 1; return H * 0.84 - (m - lo) / (hi - lo) * H * 0.64; },
+  px(i) { return lerp(W * 0.12, W * 0.8, i / (this.up.length - 1)); },
+  posOf(k) { if (k < 0) return { x: W * 0.05, y: H * 0.93 }; const m = this.path[k], i = k < this.up.length ? k : this.path.length - 1 - k; return { x: this.px(i), y: this.ys(m) }; },
+  get tgt() { return this.path[this.k + 1]; },
+  replay() { if (this.tgt != null) { Pitch.playTone(this.tgt, 0.8); this.helped.add(this.k + 1); } },
+  update(dt) {
+    const d = D(); this.time += dt;
+    if (this.toneAtStart) { this.toneAtStart = false; Pitch.playTone(this.path[0], 0.9); }
+    if (this.hop) { this.hop.t += dt; if (this.hop.t >= 0.45) this.hop = null; }
+    if (this.finished || this.hop) { hud({ score: this.score, prog: (this.k + 1) / this.path.length }); return; }
+    const tgt = this.tgt, sung = fold(Pitch.midi, tgt); this.sung = sung; this.noteT += dt; this.helpT += dt;
+    const need = 0.5 * d.hold / 1.4;
+    if (sung != null && !Pitch.gated && Math.abs((sung - tgt) * 100) <= d.tol * 1.4) this.hold += dt;
+    else this.hold = Math.max(0, this.hold - dt * 0.6);
+    if (this.helpT > 5 && S.guide) { this.helpT = 0; this.replay(); FX.text(this.posOf(this.k + 1).x, this.posOf(this.k + 1).y - 70, 'Écoute !', '#fde047', 28); }
+    if (this.hold >= need) {
+      const from = this.posOf(this.k); this.k++; const to = this.posOf(this.k);
+      this.hop = { from, to, t: 0 }; this.hold = 0; this.helpT = 0;
+      const pts = this.helped.has(this.k) ? 40 : 100 + Math.round(Math.max(0, 4 - this.noteT) * 15); this.score += pts; this.noteT = 0;
+      FX.burst(to.x, to.y, '#fde047', 16); Pitch.sfx('ok');
+      if (this.k === this.up.length - 1) FX.text(W / 2, H * 0.2, 'SOMMET !', '#fde047', 56, 1.5);
+      if (this.k === this.path.length - 1) {
+        this.finished = true;
+        const clean = this.path.length - this.helped.size;
+        setTimeout(() => Engine.finish({ score: this.score, acc: clean / this.path.length, lines: [['Marches chantées', `${this.path.length} / ${this.path.length}`], ['Sans aide', `${clean} / ${this.path.length}`], ['Temps', `${Math.round(this.time)} s`]] }), 600);
+      }
+    }
+    hud({ score: this.score, prog: (this.k + 1) / this.path.length });
+  },
+  draw(c) {
+    const t = Engine.t, d = D();
+    c.fillStyle = vgrad(c, H, [[0, '#1e1b4b'], [0.5, '#6d28d9'], [1, '#f9a8d4']]); c.fillRect(0, 0, W, H);
+    drawStars(c, this.stars, t);
+    const mx = W * 0.88, my = H * 0.18, mr = Math.min(W, H) * 0.08;
+    glow(c, mx, my, mr * 3, 'rgba(254,249,195,.4)'); c.fillStyle = '#fef9c3'; c.beginPath(); c.arc(mx, my, mr, 0, TAU); c.fill();
+    c.globalAlpha = 0.3; drawClouds(c, this.clouds, W, Engine.dt); c.globalAlpha = 1;
+    const n = this.up.length, goingDown = this.k >= n - 1;
+    for (let i = 0; i < n; i++) {
+      const x = this.px(i), y = this.ys(this.up[i]);
+      const reached = goingDown || i <= this.k;
+      const isNext = (this.k + 1 < this.path.length) && this.posOf(this.k + 1).x === x;
+      if (isNext) glow(c, x, y + 10, 70, 'rgba(253,224,71,.45)');
+      cloud(c, x, y + 26, Math.max(16, Math.min(W, H) * 0.028));
+      badge(c, x, y + 30, (d.hideNames && !reached && !isNext) ? '?' : nn(this.up[i]), isNext ? '#fde047' : reached ? '#bbf7d0' : '#fff', INK, 14);
+      if (isNext) { c.fillStyle = '#fde047'; c.strokeStyle = INK; c.lineWidth = 2.5; const ay = y - 70 + Math.sin(t * 5) * 6; c.beginPath(); c.moveTo(x - 10, ay); c.lineTo(x + 10, ay); c.lineTo(x, ay + 14); c.closePath(); c.fill(); c.stroke(); }
+    }
+    let p = this.posOf(this.k), sq = 0;
+    if (this.hop) { const k = this.hop.t / 0.45; p = { x: lerp(this.hop.from.x, this.hop.to.x, k), y: lerp(this.hop.from.y, this.hop.to.y, k) - Math.sin(Math.PI * k) * 70 }; sq = -0.3; }
+    else if (this.hold > 0) sq = Math.min(1, this.hold / 0.6) * 0.6;
+    const bs = Math.max(20, Math.min(W, H) * 0.045);
+    drawBunny(c, p.x, p.y - bs * 1.0, bs, t, sq);
+    if (!this.finished && this.tgt != null) {
+      const ring = clamp(this.hold / (0.5 * d.hold / 1.4), 0, 1);
+      if (ring > 0) { c.strokeStyle = '#4ade80'; c.lineWidth = 6; c.lineCap = 'round'; c.beginPath(); c.arc(p.x, p.y - bs, bs * 1.6, -Math.PI / 2, -Math.PI / 2 + TAU * ring); c.stroke(); }
+      drawMeter(c, W - 80, H * 0.3, 56, H * 0.45, this.tgt, this.sung, d.tol * 1.4);
+      speech(c, W * 0.3, H * 0.2, this.k < 0 ? `Chante ${nn(this.tgt)} pour monter !` : (this.k < n - 1 ? 'Monte la gamme !' : 'Redescends !'), 15);
+    }
+  }
+};
+
+/* =========================================================
+   JEU 7 : LE DRAGON ET LA PERLE (sirène / glissando)
+   ========================================================= */
+const DragonGame = {
+  id: 'dragon', title: 'Le Dragon et la Perle', replayable: false,
+  init() {
+    const d = D();
+    this.dur = { facile: 40, moyen: 45, difficile: 50 }[S.difficulty] || 45; this.fq = { facile: 0.6, moyen: 0.85, difficile: 1.15 }[S.difficulty] || 0.85;
+    this.time = 0; this.cam = 0; this.resize(); this.y = yFor((S.low + S.high) / 2); this.vy = 0; this.trail = [];
+    this.score = 0; this.on = 0; this.total = 0; this.pearls = []; this.nextPearl = W * 0.9; this.eaten = 0; this.missedP = 0; this.lastSing = -9;
+    this.ph1 = rand(0, TAU); this.ph2 = rand(0, TAU); this.clouds = makeClouds(6, W, H, 0.1, 0.55);
+  },
+  resize() { this.speed = W * 0.16; this.hx = W * 0.32; this.ds = Math.max(20, Math.min(W, H) * 0.045); },
+  curve(wx) {
+    const lo = S.low + 0.5, hi = S.high - 0.5, mid = (lo + hi) / 2, A = (hi - lo) / 2 * 0.85, tt = wx / this.speed;
+    const env = Math.min(1, Math.max(0, tt - 1) / 3);
+    return mid + A * env * (0.65 * Math.sin(tt * 0.9 * this.fq + this.ph1) * 1 + 0.35 * Math.sin(tt * 2.1 * this.fq + this.ph2));
+  },
+  bandPx() { return pxSemi() * D().tol * 1.6 / 100 + this.ds * 0.4; },
+  update(dt) {
+    const d = D(); this.time += dt; this.cam += this.speed * dt;
+    const wx = this.cam + this.hx, tgt = this.curve(wx), sung = fold(Pitch.midi, tgt), py = this.y;
+    if (sung != null) { this.y = lerp(this.y, clamp(yFor(sung), H * 0.1, H * 0.94), Math.min(1, dt * 12)); this.lastSing = this.time; }
+    else if (this.time - this.lastSing > 0.8) this.y = Math.min(H * 0.92, this.y + H * 0.05 * dt);
+    this.vy = (this.y - py) / Math.max(dt, 0.001);
+    this.trail.push(this.y); while (this.trail.length > 90) this.trail.shift();
+    const singing = this.time - this.lastSing < 0.4, inBand = Math.abs(this.y - yFor(tgt)) <= this.bandPx();
+    this.total += dt;
+    if (singing && inBand) { this.on += dt; this.score += dt * 50; if (Math.random() < 0.25) FX.burst(this.hx, this.y, '#fde68a', 1, 120); }
+    while (this.nextPearl - this.cam < W + 60) { this.pearls.push({ wx: this.nextPearl, done: false, got: false }); this.nextPearl += this.speed * rand(1.3, 2.0); }
+    for (const p of this.pearls) {
+      if (p.done || p.wx > wx) continue;
+      p.done = true;
+      if (singing && Math.abs(this.y - yFor(this.curve(p.wx))) <= this.bandPx() + this.ds * 0.3) { p.got = true; this.eaten++; this.score += 60; FX.burst(this.hx + this.ds, this.y, '#fbcfe8', 18); FX.text(this.hx + 60, this.y - 50, 'MIAM !', '#fbcfe8', 34); Pitch.sfx('ok'); }
+      else this.missedP++;
+    }
+    this.pearls = this.pearls.filter(p => p.wx - this.cam > -60);
+    hud({ score: Math.floor(this.score), prog: clamp(this.time / this.dur, 0, 1) });
+    if (this.time >= this.dur) {
+      const acc = this.total ? this.on / this.total : 0;
+      Engine.finish({ score: Math.floor(this.score), acc: clamp(acc * 1.15, 0, 1), lines: [['Temps sur le ruban', `${Math.round(acc * 100)} %`], ['Perles attrapées', `${this.eaten} / ${this.eaten + this.missedP}`]] });
+    }
+  },
+  draw(c) {
+    const t = Engine.t;
+    c.fillStyle = vgrad(c, H, [[0, '#312e81'], [0.5, '#db2777'], [0.85, '#fb923c'], [1, '#fde68a']]); c.fillRect(0, 0, W, H);
+    glow(c, W * 0.7, H * 0.78, H * 0.35, 'rgba(254,240,138,.6)'); c.fillStyle = '#fef3c7'; c.beginPath(); c.arc(W * 0.7, H * 0.78, H * 0.11, 0, TAU); c.fill();
+    c.fillStyle = 'rgba(76,29,149,.85)'; c.beginPath(); c.moveTo(W * 0.15, H); c.lineTo(W * 0.42, H * 0.6); c.lineTo(W * 0.5, H * 0.62); c.lineTo(W * 0.78, H); c.closePath(); c.fill();
+    c.fillStyle = '#f5f3ff'; c.beginPath(); c.moveTo(W * 0.37, H * 0.67); c.lineTo(W * 0.42, H * 0.6); c.lineTo(W * 0.5, H * 0.62); c.lineTo(W * 0.53, H * 0.67); c.lineTo(W * 0.48, H * 0.65); c.lineTo(W * 0.44, H * 0.68); c.closePath(); c.fill();
+    mountains(c, W, H, H * 1.02, H * 0.15, this.cam * 0.2, 'rgba(49,46,129,.9)', 7);
+    drawClouds(c, this.clouds, W, Engine.dt, this.speed * 0.2);
+    staffLines(c, 'rgba(255,255,255,.18)', 'rgba(255,255,255,.8)');
+    const band = this.bandPx();
+    c.save(); c.lineCap = 'round'; c.lineJoin = 'round';
+    c.beginPath(); for (let sx = 0; sx <= W; sx += 6) { const y = yFor(this.curve(this.cam + sx)); sx ? c.lineTo(sx, y) : c.moveTo(sx, y); }
+    c.strokeStyle = 'rgba(253,224,71,.28)'; c.lineWidth = band * 2; c.stroke();
+    c.setLineDash([10, 12]); c.strokeStyle = 'rgba(255,255,255,.85)'; c.lineWidth = 3; c.stroke(); c.restore();
+    for (const p of this.pearls) {
+      if (p.done && !p.got) continue; if (p.got) continue;
+      const sx = p.wx - this.cam, y = yFor(this.curve(p.wx));
+      glow(c, sx, y, 26, 'rgba(255,255,255,.7)'); const g = c.createRadialGradient(sx - 4, y - 4, 1, sx, y, 11); g.addColorStop(0, '#fff'); g.addColorStop(1, '#f9a8d4');
+      c.fillStyle = g; c.beginPath(); c.arc(sx, y, 11, 0, TAU); c.fill(); c.lineWidth = 2.5; c.strokeStyle = INK; c.stroke();
+    }
+    const segs = 14, sp = this.ds * 0.75;
+    for (let i = segs; i >= 1; i--) {
+      const idx = Math.max(0, this.trail.length - 1 - Math.round(i * sp / (this.speed / 60)));
+      const y = this.trail[idx] ?? this.y, x = this.hx - i * sp * 0.9, r = this.ds * (0.55 - i * 0.022);
+      c.fillStyle = '#ef4444'; c.strokeStyle = INK; c.lineWidth = 2;
+      if (i % 2 === 0) { c.beginPath(); c.moveTo(x - r * 0.5, y - r * 0.8); c.lineTo(x, y - r * 1.5); c.lineTo(x + r * 0.5, y - r * 0.8); c.closePath(); c.fill(); c.stroke(); }
+      c.fillStyle = i % 2 ? '#10b981' : '#34d399'; c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill(); c.lineWidth = 2.5; c.stroke();
+      c.fillStyle = '#fde68a'; ell(c, x, y + r * 0.45, r * 0.6, r * 0.3); c.fill();
+    }
+    drawDragonHead(c, this.hx, this.y, this.ds, t, clamp(this.vy * 0.0012, -0.45, 0.45));
+    const left = Math.max(0, Math.ceil(this.dur - this.time));
+    badge(c, W / 2, H * 0.92, `⏱ ${left} s   ♪ ${Pitch.midi != null ? nn(fold(Pitch.midi, this.curve(this.cam + this.hx))) : '…'}`, '#fff', INK, 16);
+    if (this.time < 4) speech(c, this.hx + this.ds, this.y - this.ds * 1.6, 'Fais glisser ta voix pour suivre le ruban !', 15);
+  }
+};
+
+const GAMES = { bird: BirdGame, dolphin: DolphinGame, kitsune: KitsuneGame, echo: EchoGame, lantern: LanternGame, stairs: StairsGame, dragon: DragonGame, dojo: DojoGame };
 
 /* =========================================================
    MOTEUR DE JEU
@@ -1184,7 +1509,7 @@ const Engine = {
     for (const k in HUDc) delete HUDc[k];
     $('gTitle').textContent = g.title; $('gScore').textContent = '0'; $('gCombo').textContent = ''; $('gProg').style.width = '0%';
     $('gHearts').textContent = ''; $('gScoreBox').classList.toggle('hidden', !!g.noScore); $('gProgWrap').classList.toggle('hidden', !!g.noScore);
-    $('replayBtn').classList.toggle('hidden', !(g.id === 'bird' || g.id === 'dolphin'));
+    $('replayBtn').classList.toggle('hidden', !(g.id === 'bird' || g.id === 'dolphin' || g.id === 'stairs'));
     $('replayBtn').textContent = g.id === 'dojo' ? '🔊 Note cible' : g.id === 'echo' ? '🔊 Réécouter la mélodie' : '🔊 Réécouter la note';
     resizeGame(); FX.clear(); g.init();
     this.paused = false; this.ended = false; this.running = false; this.countdown = g.noScore ? 0 : 3.2;
@@ -1286,6 +1611,9 @@ const MODES = [
   { id: 'dolphin', title: 'La Plongée de Kai', jp: '海の旅', desc: 'Kai le dauphin nage entre les rochers : tiens la bonne note pour rester dans le passage !', skill: 'Tenir et changer de note', bgc: 'from-cyan-300 to-blue-600' },
   { id: 'kitsune', title: 'Le Sceau de Kitsune', jp: '狐の封印', desc: "Écoute la note de l'esprit farceur, puis tiens-la bien juste pour charger le sceau de Kitsune.", skill: 'Reproduire une note', bgc: 'from-indigo-600 to-pink-400' },
   { id: 'echo', title: "L'Écho des Étoiles", jp: '星のこだま', desc: 'Hoshi joue une petite mélodie : écoute, puis rechante-la note après note.', skill: 'Mémoire mélodique', bgc: 'from-slate-800 to-indigo-500' },
+  { id: 'lantern', title: 'Les Lanternes du Festival', jp: '夏祭り', desc: "Des lanternes s'envolent pendant le festival : chante la note de l'une d'elles pour l'allumer avant qu'elle disparaisse.", skill: 'Reconnaître et viser une note', bgc: 'from-indigo-900 to-rose-700' },
+  { id: 'stairs', title: "L'Ascension d'Usagi", jp: '月への階段', desc: "Aide le lapin Usagi à grimper vers la lune : chante la gamme marche après marche, puis redescends.", skill: 'Chanter une gamme', bgc: 'from-violet-700 to-pink-300' },
+  { id: 'dragon', title: 'Le Dragon et la Perle', jp: '龍の玉', desc: "Ryū le dragon suit ta voix : fais-la glisser comme une sirène pour rester sur le ruban doré et gober les perles.", skill: 'Glissando / sirène', bgc: 'from-indigo-800 via-pink-600 to-orange-300' },
   { id: 'dojo', title: 'Le Dojo de la Voix', jp: '声の道場', desc: "Entraînement libre : vois ta voix en direct, touche une note pour l'entendre et imite-la.", skill: 'Échauffement', bgc: 'from-pink-200 to-violet-300' }
 ];
 function renderCards() {
@@ -1331,6 +1659,17 @@ function drawPreview(cvs) {
     c.setLineDash([4, 5]); c.strokeStyle = 'rgba(255,255,255,.6)'; c.lineWidth = 2; c.beginPath(); pts.forEach((p, i) => i ? c.lineTo(p[0] * w, p[1] * h) : c.moveTo(p[0] * w, p[1] * h)); c.stroke(); c.setLineDash([]);
     pts.forEach((p, i) => { glow(c, p[0] * w, p[1] * h, 22, 'rgba(253,224,71,.5)'); c.fillStyle = i < 2 ? '#fde047' : '#93c5fd'; c.beginPath(); c.arc(p[0] * w, p[1] * h, 9, 0, TAU); c.fill(); c.lineWidth = 2.5; c.strokeStyle = INK; c.stroke(); });
     drawHoshi(c, w * 0.2, h * 0.55, s * 1.1, 0);
+  } else if (id === 'lantern') {
+    for (let i = 0; i < 25; i++) { c.fillStyle = 'rgba(255,255,255,.7)'; c.beginPath(); c.arc((i * 61) % w, (i * 37) % (h * 0.6), 1.2, 0, TAU); c.fill(); }
+    paperLantern(c, w * 0.3, h * 0.45, s * 0.9, 1, 0, 'Mi'); paperLantern(c, w * 0.55, h * 0.6, s * 0.8, 0.2, 0, 'Sol'); paperLantern(c, w * 0.78, h * 0.38, s * 0.8, 0.5, 0, 'Do');
+  } else if (id === 'stairs') {
+    c.fillStyle = '#fef9c3'; c.beginPath(); c.arc(w * 0.88, h * 0.22, 16, 0, TAU); c.fill();
+    for (let i = 0; i < 5; i++) cloud(c, w * (0.2 + i * 0.15), h * (0.85 - i * 0.14), 10);
+    drawBunny(c, w * 0.5, h * 0.42, s * 0.7, 0);
+  } else if (id === 'dragon') {
+    c.strokeStyle = 'rgba(253,224,71,.5)'; c.lineWidth = 16; c.lineCap = 'round'; c.beginPath(); for (let x = 0; x <= w; x += 6) { const y = h * 0.5 + Math.sin(x * 0.025) * h * 0.22; x ? c.lineTo(x, y) : c.moveTo(x, y); } c.stroke();
+    for (let i = 6; i >= 1; i--) { const x = w * 0.4 - i * 12, y = h * 0.5 + Math.sin(x * 0.025) * h * 0.22; c.fillStyle = '#10b981'; c.beginPath(); c.arc(x, y, 9 - i * 0.6, 0, TAU); c.fill(); c.lineWidth = 2; c.strokeStyle = INK; c.stroke(); }
+    drawDragonHead(c, w * 0.4, h * 0.5 + Math.sin(w * 0.4 * 0.025) * h * 0.22, s * 0.8, 0, -0.3);
   } else if (id === 'dojo') {
     c.strokeStyle = 'rgba(29,26,58,.25)'; c.setLineDash([6, 8]); c.lineWidth = 2;
     for (let i = 1; i < 6; i++) { c.beginPath(); c.moveTo(0, h * i / 6); c.lineTo(w, h * i / 6); c.stroke(); } c.setLineDash([]);
@@ -1362,7 +1701,7 @@ function renderSettings() {
   const d = D(); $('diffInfo').textContent = `Tolérance ±${d.tol} cents · ${d.scale.length === 5 ? 'gamme pentatonique (5 notes)' : 'gamme de do majeur'} · vitesse ×${d.speed}${d.hideNames ? ' · noms de notes cachés dans l’Écho' : ''}`;
   $('tgOct').classList.toggle('on', S.octaveFree); $('tgGuide').classList.toggle('on', S.guide);
   seg($('notSeg'), [['fr', 'Do Ré Mi (La3 = 440)'], ['en', 'C D E (A4 = 440)']], S.notation, v => { S.notation = v; saveSettings(); renderSettings(); });
-  seg($('sensSeg'), [[1, 'Faible (classe bruyante)'], [2, 'Normale'], [3, 'Forte']], S.sens, v => { S.sens = +v; saveSettings(); renderSettings(); });
+  seg($('sensSeg'), [[1, 'Faible (classe bruyante)'], [2, 'Normale (sensible)'], [3, 'Très forte']], S.sens, v => { S.sens = +v; saveSettings(); renderSettings(); });
 }
 function updateSummary() {
   const d = D();
