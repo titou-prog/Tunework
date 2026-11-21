@@ -165,6 +165,12 @@
       <span id="setNote" class="font-black text-2xl w-24 text-center">—</span>
       <div class="flex-1 h-3 bg-white rounded-full overflow-hidden border-2 border-[#1d1a3a]"><div id="setLvl" class="h-full bg-emerald-400" style="width:0%"></div></div>
     </div>
+    <div class="mt-3 flex flex-wrap items-center gap-3">
+      <span class="font-black">🔊 Volume</span>
+      <input id="volR" type="range" min="0.2" max="1.5" step="0.05" class="flex-1 min-w-[8rem] accent-pink-500">
+      <button id="testTone" class="btn bg-yellow-300 px-4 py-2">▶ Tester le son</button>
+    </div>
+    <div id="diag" class="mt-2 text-xs font-bold text-slate-500"></div>
     <div class="mt-4 text-right"><button id="setOk" class="btn bg-emerald-300 px-6 py-2 text-lg">C'est parti !</button></div>
   </div>
   </div>
@@ -188,7 +194,7 @@ const FONT = '"M PLUS Rounded 1c", system-ui, sans-serif';
    RÉGLAGES
    ========================================================= */
 const LS_KEY = 'tunework_settings_v1', BEST_KEY = 'tunework_best_v1';
-const DEF = { low: 60, high: 72, difficulty: 'moyen', octaveFree: true, guide: true, notation: 'fr', sens: 2 };
+const DEF = { low: 60, high: 72, difficulty: 'moyen', octaveFree: true, guide: true, notation: 'fr', sens: 2, volume: 0.9 };
 let S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem(LS_KEY) || '{}')); } catch (e) {}
 function saveSettings() { try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {} updateSummary(); }
@@ -199,7 +205,7 @@ const DIFF = {
   difficile: { label: 'Difficile', tol: 22, speed: 1.2, step: 4, hold: 1.8, time: 9,  scale: [0, 2, 4, 5, 7, 9, 11], echo: [3, 4, 4, 5, 5, 6], hideNames: true }
 };
 const D = () => DIFF[S.difficulty] || DIFF.moyen;
-const RMS_TH = { 1: 0.035, 2: 0.016, 3: 0.007 };
+const RMS_TH = { 1: 0.02, 2: 0.008, 3: 0.003 };
 
 const NF = ['Do', 'Do♯', 'Ré', 'Ré♯', 'Mi', 'Fa', 'Fa♯', 'Sol', 'Sol♯', 'La', 'La♯', 'Si'];
 const NE = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
@@ -248,24 +254,44 @@ function rating(cents, tol) {
    MOTEUR AUDIO : micro + détection de hauteur (YIN) + sons
    ========================================================= */
 const Pitch = {
-  ctx: null, an: null, buf: null, d: null, master: null, ready: false,
-  midi: null, rms: 0, hist: [], lastHeard: 0, gateUntil: 0, frame: 0,
+  ctx: null, an: null, buf: null, d: null, master: null, stream: null, ready: false,
+  midi: null, freq: null, rms: 0, hist: [], lastHeard: 0, gateUntil: 0, frame: 0,
+  zeroSince: 0, rebuilds: 0, cache: {},
+  /* 1) on ouvre d'abord le micro, 2) PUIS on crée le moteur audio à la fréquence réelle du micro.
+     (Sur iPad, créer le moteur avant le micro rend le micro muet et fait grésiller le son.) */
   async init() {
     if (this.ready) return true;
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!this.ctx) this.ctx = new AC();
-    const resumeP = this.ctx.state === 'suspended' ? this.ctx.resume() : Promise.resolve();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    await resumeP;
-    const src = this.ctx.createMediaStreamSource(stream);
-    this.an = this.ctx.createAnalyser(); this.an.fftSize = 2048;
-    src.connect(this.an);
-    this.buf = new Float32Array(this.an.fftSize);
-    this.d = new Float32Array(this.an.fftSize);
-    this.master = this.ctx.createGain(); this.master.gain.value = 0.7; this.master.connect(this.ctx.destination);
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const tr = this.stream.getAudioTracks()[0];
+    const st = (tr && tr.getSettings) ? tr.getSettings() : {};
+    this.build(st.sampleRate);
     this.ready = true;
+    this.unlock();
     return true;
   },
+  build(sr) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (this.ctx) { try { this.ctx.close(); } catch (e) {} }
+    try { this.ctx = sr ? new AC({ sampleRate: sr }) : new AC(); } catch (e) { this.ctx = new AC(); }
+    const c = this.ctx;
+    const src = c.createMediaStreamSource(this.stream);
+    const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 65;
+    this.an = c.createAnalyser(); this.an.fftSize = 2048; this.an.smoothingTimeConstant = 0;
+    src.connect(hp); hp.connect(this.an);
+    /* Safari ne fait « tourner » l'analyse que si la chaîne aboutit à la sortie : on la relie avec un volume nul */
+    const sink = c.createGain(); sink.gain.value = 0; this.an.connect(sink); sink.connect(c.destination);
+    const comp = c.createDynamicsCompressor(); comp.threshold.value = -10; comp.ratio.value = 4;
+    this.master = c.createGain(); this.master.gain.value = S.volume; this.master.connect(comp); comp.connect(c.destination);
+    this.buf = new Float32Array(this.an.fftSize); this.d = new Float32Array(this.an.fftSize);
+    this.cache = {}; this.zeroSince = performance.now(); this.hist.length = 0; this.midi = null;
+  },
+  unlock() {
+    if (!this.ctx) return;
+    if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {});
+    try { const b = this.ctx.createBuffer(1, 1, this.ctx.sampleRate), s = this.ctx.createBufferSource(); s.buffer = b; s.connect(this.ctx.destination); s.start(0); } catch (e) {}
+  },
+  setVolume(v) { if (this.master) this.master.gain.value = v; },
+  get running() { return !!this.ctx && this.ctx.state === 'running'; },
   get gated() { return !!this.ctx && this.ctx.currentTime < this.gateUntil; },
   update() {
     if (!this.ready) return;
@@ -274,14 +300,23 @@ const Pitch = {
     this.frame++;
     if (this.frame % 2) return; // ~30 analyses / s : léger pour l'iPad
     this.an.getFloatTimeDomainData(this.buf);
+    /* Garde-fou : si le micro ne renvoie que du silence absolu alors que le son tourne, on reconstruit le moteur */
+    let peak = 0; for (let i = 0; i < this.buf.length; i += 8) { const v = Math.abs(this.buf[i]); if (v > peak) peak = v; }
+    if (peak > 1e-6 || !this.running) this.zeroSince = now;
+    else if (now - this.zeroSince > 2500 && this.rebuilds < 3) {
+      this.rebuilds++;
+      const tries = [undefined, 48000, 44100];
+      this.build(tries[this.rebuilds - 1]); this.unlock(); return;
+    }
     const f = this.detect(this.buf, this.ctx.sampleRate);
+    this.freq = f;
     if (f) {
       const m = 69 + 12 * Math.log2(f / 440);
       this.hist.push(m); if (this.hist.length > 3) this.hist.shift();
       const s = [...this.hist].sort((a, b) => a - b);
       this.midi = s[Math.floor(s.length / 2)];
       this.lastHeard = now;
-    } else if (now - this.lastHeard > 160) { this.midi = null; this.hist.length = 0; }
+    } else if (now - this.lastHeard > 180) { this.midi = null; this.hist.length = 0; }
   },
   detect(x, sr) {
     const n = x.length; let rms = 0;
@@ -298,50 +333,63 @@ const Pitch = {
     }
     let found = -1;
     for (let tau = minLag; tau <= maxLag; tau++) {
-      if (d[tau] < 0.15) { while (tau + 1 <= maxLag && d[tau + 1] < d[tau]) tau++; found = tau; break; }
+      if (d[tau] < 0.2) { while (tau + 1 <= maxLag && d[tau + 1] < d[tau]) tau++; found = tau; break; }
     }
     if (found < 0) {
       let mi = minLag; for (let tau = minLag; tau <= maxLag; tau++) if (d[tau] < d[mi]) mi = tau;
-      if (d[mi] < 0.25) found = mi; else return null;
+      if (d[mi] < 0.35) found = mi; else return null;
     }
     let t = found;
     if (t > 1 && t < maxLag) { const a = d[t - 1], b = d[t], c = d[t + 1], den = a - 2 * b + c; if (den !== 0) t += 0.5 * (a - c) / den; }
     const f = sr / t;
     return (f >= 75 && f <= 1100) ? f : null;
   },
-  /* Note guide : le micro est mis en sourdine pendant qu'elle sonne (pas de triche !) */
+  /* Son de la note guide : timbre doux de « flûte / voix ouh », calculé une fois puis rejoué (son propre, sans grésillement) */
+  toneBuffer(m, dur) {
+    const key = m + ':' + dur; if (this.cache[key]) return this.cache[key];
+    const sr = this.ctx.sampleRate, n = Math.floor(sr * dur), b = this.ctx.createBuffer(1, n, sr), ch = b.getChannelData(0), f = hz(m);
+    const H = f < 200 ? [1, 0.6, 0.35, 0.18, 0.08] : [1, 0.3, 0.1, 0.04];
+    const atk = 0.05, rel = 0.18; let peak = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr, ph = TAU * f * t; let v = 0;
+      for (let k = 0; k < H.length; k++) v += H[k] * Math.sin(ph * (k + 1));
+      const env = t < atk ? smooth(t / atk) : t > dur - rel ? smooth(Math.max(0, (dur - t) / rel)) : 1;
+      ch[i] = v * env * (1 - 0.12 * Math.min(1, t / dur)); if (Math.abs(ch[i]) > peak) peak = Math.abs(ch[i]);
+    }
+    for (let i = 0; i < n; i++) ch[i] = ch[i] / peak * 0.8;
+    return (this.cache[key] = b);
+  },
+  /* Le micro est mis en sourdine pendant la note guide (pas de triche !) */
   playTone(m, dur = 0.8, delay = 0) {
     if (!this.ctx) return;
-    const t0 = this.ctx.currentTime + delay, f = hz(m);
-    const g = this.ctx.createGain();
-    g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.42, t0 + 0.03);
-    g.gain.setValueAtTime(0.42, t0 + dur - 0.15); g.gain.linearRampToValueAtTime(0, t0 + dur);
-    g.connect(this.master);
-    [[1, 'triangle', 1], [2, 'sine', 0.3], [3, 'sine', f < 200 ? 0.2 : 0.08]].forEach(([k, type, v]) => {
-      const o = this.ctx.createOscillator(), og = this.ctx.createGain();
-      o.type = type; o.frequency.value = f * k; og.gain.value = v;
-      o.connect(og); og.connect(g); o.start(t0); o.stop(t0 + dur + 0.05);
-    });
+    this.unlock();
+    let pm = Math.round(m);
+    if (S.octaveFree && hz(pm) < 200) pm += 12; // les notes très graves passent mal dans le haut-parleur de l'iPad
+    const t0 = this.ctx.currentTime + delay + 0.02;
+    const s = this.ctx.createBufferSource(); s.buffer = this.toneBuffer(pm, dur);
+    s.connect(this.master); s.start(t0);
     this.gateUntil = Math.max(this.gateUntil, t0 + dur + 0.2);
   },
   sfx(type) {
     if (!this.ctx) return;
-    const t = this.ctx.currentTime;
-    const tone = (f, st, d, typ = 'sine', v = 0.22) => {
+    const t = this.ctx.currentTime + 0.01;
+    const tone = (f, st, d, v = 0.3) => {
       const o = this.ctx.createOscillator(), g = this.ctx.createGain();
-      o.type = typ; o.frequency.setValueAtTime(f, t + st);
-      g.gain.setValueAtTime(0, t + st); g.gain.linearRampToValueAtTime(v, t + st + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.001, t + st + d);
+      o.type = 'sine'; o.frequency.setValueAtTime(f, t + st);
+      g.gain.setValueAtTime(0.0001, t + st); g.gain.exponentialRampToValueAtTime(v, t + st + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + st + d);
       o.connect(g); g.connect(this.master); o.start(t + st); o.stop(t + st + d + 0.05); return o;
     };
     let dur = 0.3;
-    if (type === 'ok') { tone(1568, 0, 0.15); tone(2093, 0.07, 0.25); dur = 0.32; }
-    else if (type === 'ko') { const o = tone(220, 0, 0.3, 'square', 0.1); o.frequency.exponentialRampToValueAtTime(110, t + 0.3); dur = 0.35; }
-    else if (type === 'seal') { const o = tone(300, 0, 0.8, 'sawtooth', 0.12); o.frequency.exponentialRampToValueAtTime(1800, t + 0.6); tone(2637, 0.5, 0.6, 'sine', 0.2); dur = 1.1; }
-    else if (type === 'win') { [1047, 1319, 1568, 2093].forEach((f, i) => tone(f, i * 0.1, 0.45, 'triangle', 0.18)); dur = 0.9; }
+    if (type === 'ok') { tone(1319, 0, 0.18); tone(1976, 0.08, 0.3); dur = 0.4; }
+    else if (type === 'ko') { const o = tone(330, 0, 0.3, 0.25); o.frequency.exponentialRampToValueAtTime(196, t + 0.3); dur = 0.35; }
+    else if (type === 'seal') { const o = tone(392, 0, 0.6, 0.25); o.frequency.exponentialRampToValueAtTime(1568, t + 0.5); tone(2093, 0.5, 0.7, 0.25); tone(2637, 0.6, 0.6, 0.15); dur = 1.2; }
+    else if (type === 'win') { [1047, 1319, 1568, 2093].forEach((f, i) => tone(f, i * 0.1, 0.5, 0.22)); dur = 0.9; }
     this.gateUntil = Math.max(this.gateUntil, t + dur);
   }
 };
+document.addEventListener('touchend', () => Pitch.unlock(), { passive: true });
+document.addEventListener('click', () => Pitch.unlock(), { passive: true });
 
 /* =========================================================
    DESSIN : primitives « anime »
@@ -1212,7 +1260,9 @@ function startHome() { cancelAnimationFrame(homeRaf); homeLast = performance.now
 function stopHome() { cancelAnimationFrame(homeRaf); }
 function updateMicUI() {
   if (!Pitch.ready) return;
-  const lvl = clamp(Pitch.rms / 0.12, 0, 1) * 100 + '%', note = Pitch.midi != null ? nn(Pitch.midi, true) : '—';
+  const dg = $('diag');
+  if (dg && !$('setOv').classList.contains('hidden')) dg.textContent = `Diagnostic : son ${Pitch.running ? 'actif' : 'en pause (touche l’écran)'} · ${Pitch.ctx ? Pitch.ctx.sampleRate : '?'} Hz · niveau micro ${Pitch.rms.toFixed(3)} (seuil ${RMS_TH[S.sens]}) · hauteur ${Pitch.freq ? Math.round(Pitch.freq) + ' Hz' : '—'}${Pitch.rebuilds ? ' · moteur relancé ×' + Pitch.rebuilds : ''}`;
+  const lvl = clamp(Pitch.rms / 0.06, 0, 1) * 100 + '%', note = !Pitch.running ? '👆' : Pitch.midi != null ? nn(Pitch.midi, true) : '—';
   $('micLvl').style.width = lvl; $('micNote').textContent = note; $('setLvl').style.width = lvl; $('setNote').textContent = note;
 }
 function showErr(msg) { const e = $('micErr'); e.textContent = msg; e.classList.remove('hidden'); }
@@ -1292,7 +1342,7 @@ function drawPreview(cvs) {
 
 async function launch(id) {
   if (!Pitch.ready) { const ok = await initMic(); if (!ok) { window.scrollTo(0, 0); return; } }
-  try { if (Pitch.ctx.state !== 'running') await Pitch.ctx.resume(); } catch (e) {}
+  Pitch.unlock();
   stopHome(); Engine.start(GAMES[id]);
 }
 
@@ -1353,6 +1403,9 @@ $('setBtn').onclick = () => { renderSettings(); $('setOv').classList.remove('hid
 $('setClose').onclick = $('setOk').onclick = () => { $('setOv').classList.add('hidden'); calib = null; $('calMsg').textContent = ''; };
 $('calLow').onclick = () => startCalib('low');
 $('calHigh').onclick = () => startCalib('high');
+$('volR').value = S.volume;
+$('volR').oninput = e => { S.volume = +e.target.value; Pitch.setVolume(S.volume); saveSettings(); };
+$('testTone').onclick = async () => { if (!Pitch.ready && !(await initMic())) return; Pitch.unlock(); [60, 64, 67, 72].forEach((m, i) => Pitch.playTone(m, 0.5, i * 0.55)); };
 $('tgOct').onclick = () => { S.octaveFree = !S.octaveFree; saveSettings(); renderSettings(); };
 $('tgGuide').onclick = () => { S.guide = !S.guide; saveSettings(); renderSettings(); };
 $('fsBtn').onclick = () => { const el = document.documentElement; try { if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document); else (el.requestFullscreen || el.webkitRequestFullscreen).call(el); } catch (e) {} };
